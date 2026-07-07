@@ -1,0 +1,839 @@
+"""
+AI Snake — A polished arcade-style Snake game built with Pygame.
+Single-file, beginner-friendly, ~60 FPS.
+"""
+import pygame
+import random
+import math
+import json
+import os
+import array
+from enum import Enum, auto
+
+# ── Display ──────────────────────────────────────────────────────────────────
+SCREEN_W, SCREEN_H = 640, 640
+CELL = 20
+COLS, ROWS = SCREEN_W // CELL, SCREEN_H // CELL
+FPS = 60
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snake_data.json")
+AUTHOR = "arindcha@gmail.com"
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+C_BG_TOP = (12, 14, 28)
+C_BG_BOT = (22, 28, 48)
+C_GRID = (40, 50, 75, 35)
+C_SNAKE = (72, 220, 140)
+C_SNAKE_DARK = (40, 150, 95)
+C_HEAD = (100, 255, 170)
+C_APPLE = (255, 70, 70)
+C_APPLE_GLOW = (255, 120, 80)
+C_BONUS = (255, 210, 50)
+C_TEXT = (230, 235, 245)
+C_ACCENT = (90, 180, 255)
+C_NEON = (255, 230, 80)
+C_SHADOW = (0, 0, 0, 80)
+C_BTN = (45, 55, 85)
+C_BTN_HOVER = (65, 85, 130)
+C_OBSTACLE = (110, 70, 160)
+
+DIRS = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+OPP = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
+
+
+class State(Enum):
+    MENU = auto()
+    DIFFICULTY = auto()
+    COUNTDOWN = auto()
+    PLAYING = auto()
+    PAUSED = auto()
+    GAME_OVER = auto()
+    HIGH_SCORES = auto()
+    CONTROLS = auto()
+    STATS = auto()
+    ACHIEVEMENTS = auto()
+
+
+# ── Persistence ──────────────────────────────────────────────────────────────
+DEFAULT_DATA = {
+    "high_score": 0, "games_played": 0, "total_apples": 0,
+    "total_score": 0, "best_length": 0, "play_time": 0,
+    "achievements": [],
+}
+
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE) as f:
+                d = json.load(f)
+            for k, v in DEFAULT_DATA.items():
+                d.setdefault(k, v)
+            return d
+        except (json.JSONDecodeError, OSError):
+            pass
+    return dict(DEFAULT_DATA)
+
+
+def save_data(data):
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+# ── Sound (procedural beeps — no external files needed) ──────────────────────
+class Sounds:
+    def __init__(self):
+        self.ok = False
+        try:
+            pygame.mixer.init(22050, -16, 2, 512)
+            self.ok = True
+            self.eat = self._tone(660, 0.08)
+            self.bonus = self._tone(880, 0.12)
+            self.power = self._tone(520, 0.15)
+            self.death = self._tone(180, 0.35, decay=True)
+            self.tick = self._tone(440, 0.05)
+            self.ui = self._tone(600, 0.06)
+        except pygame.error:
+            pass
+
+    def _tone(self, freq, dur, decay=False):
+        if not self.ok:
+            return None
+        sr, n = 22050, int(22050 * dur)
+        buf = array.array("h")
+        for i in range(n):
+            t = i / sr
+            amp = 0.25 * (1 - i / n) if decay else 0.25
+            v = int(32767 * amp * math.sin(2 * math.pi * freq * t))
+            buf.extend((v, v))
+        return pygame.mixer.Sound(buffer=buf)
+
+    def play(self, snd):
+        if self.ok and snd:
+            snd.play()
+
+
+# ── Particles ────────────────────────────────────────────────────────────────
+class Particle:
+    __slots__ = ("x", "y", "vx", "vy", "life", "max_life", "color", "size", "glow")
+
+    def __init__(self, x, y, color, speed=3, life=0.6, size=4, glow=False):
+        a = random.uniform(0, math.tau)
+        s = random.uniform(1, speed)
+        self.x, self.y = x, y
+        self.vx, self.vy = math.cos(a) * s, math.sin(a) * s
+        self.life, self.max_life = life, life
+        self.color, self.size, self.glow = color, size, glow
+
+    def update(self, dt):
+        self.x += self.vx
+        self.y += self.vy
+        self.vy += 40 * dt
+        self.life -= dt
+
+    def draw(self, surf):
+        a = max(0, self.life / self.max_life)
+        r = max(1, int(self.size * a))
+        c = (*self.color[:3], int(255 * a))
+        if self.glow and r > 1:
+            gs = pygame.Surface((r * 4, r * 4), pygame.SRCALPHA)
+            pygame.draw.circle(gs, (*self.color[:3], int(80 * a)), (r * 2, r * 2), r * 2)
+            surf.blit(gs, (int(self.x) - r * 2, int(self.y) - r * 2))
+        pygame.draw.circle(surf, c[:3], (int(self.x), int(self.y)), r)
+
+
+# ── UI Button ────────────────────────────────────────────────────────────────
+class Button:
+    def __init__(self, rect, text, font, action=None):
+        self.rect = pygame.Rect(rect)
+        self.text, self.font, self.action = text, font, action
+        self.hover = self.pulse = 0.0
+
+    def update(self, dt, mouse):
+        self.hover = 0.12 if self.rect.collidepoint(mouse) else 0.0
+        self.pulse += dt * 3
+
+    def draw(self, surf):
+        t = 0.5 + 0.5 * math.sin(self.pulse)
+        scale = 1.0 + self.hover * 0.04 + t * 0.01
+        w, h = int(self.rect.w * scale), int(self.rect.h * scale)
+        bx, by = self.rect.centerx - w // 2, self.rect.centery - h // 2
+        col = C_BTN_HOVER if self.hover else C_BTN
+        pygame.draw.rect(surf, col, (bx, by + 3, w, h), border_radius=10)
+        pygame.draw.rect(surf, C_ACCENT, (bx, by, w, h), 2, border_radius=10)
+        ts = self.font.render(self.text, True, C_TEXT)
+        surf.blit(ts, ts.get_rect(center=(bx + w // 2, by + h // 2)))
+
+    def clicked(self, pos):
+        return self.rect.collidepoint(pos)
+
+
+# ── Main Game ────────────────────────────────────────────────────────────────
+class Game:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+        pygame.display.set_caption("AI Snake")
+        self.clock = pygame.time.Clock()
+        self.font_lg = pygame.font.SysFont("Segoe UI", 52, bold=True)
+        self.font_md = pygame.font.SysFont("Segoe UI", 28, bold=True)
+        self.font_sm = pygame.font.SysFont("Segoe UI", 20)
+        self.font_xs = pygame.font.SysFont("Segoe UI", 16)
+        self.sounds = Sounds()
+        self.data = load_data()
+        self.state = State.MENU
+        self.fade = 1.0
+        self.fade_target = 0.0
+        self.bg_stars = [(random.randint(0, SCREEN_W), random.randint(0, SCREEN_H),
+                          random.uniform(0.5, 2), random.uniform(0, math.tau))
+                         for _ in range(60)]
+        self.difficulty = "normal"
+        self._build_menu()
+        self.reset_match()
+
+    def _build_menu(self):
+        cx, y = SCREEN_W // 2, 200
+        gap = 58
+        self.menu_btns = [
+            Button((cx - 110, y, 220, 46), "Play", self.font_md, "play"),
+            Button((cx - 110, y + gap, 220, 46), "High Scores", self.font_md, "scores"),
+            Button((cx - 110, y + gap * 2, 220, 46), "Controls", self.font_md, "controls"),
+            Button((cx - 110, y + gap * 3, 220, 46), "Statistics", self.font_md, "stats"),
+            Button((cx - 110, y + gap * 4, 220, 46), "Achievements", self.font_md, "achieve"),
+            Button((cx - 110, y + gap * 5, 220, 46), "Quit", self.font_md, "quit"),
+        ]
+        self.diff_btns = [
+            Button((cx - 110, 260, 220, 46), "Easy", self.font_md, "easy"),
+            Button((cx - 110, 330, 220, 46), "Normal", self.font_md, "normal"),
+            Button((cx - 110, 400, 220, 46), "Hard", self.font_md, "hard"),
+            Button((cx - 110, 490, 220, 46), "Back", self.font_md, "back"),
+        ]
+
+    def reset_match(self):
+        self.snake = [(COLS // 2, ROWS // 2), (COLS // 2 - 1, ROWS // 2),
+                      (COLS // 2 - 2, ROWS // 2)]
+        self.prev_snake = list(self.snake)
+        self.direction = self.next_dir = "RIGHT"
+        self.score = self.apples = 0
+        self.move_timer = 0.0
+        self.ghost = self.slow = self.double = False
+        self.power_timer = 0.0
+        self.power_type = None
+        self.obstacles = []
+        self.move_interval = self._speed_interval()
+        self.food = self._spawn_food()
+        self.bonus = None
+        self.bonus_timer = 0.0
+        self.particles = []
+        self.shake = 0.0
+        self.countdown = 3.0
+        self.count_int = 3
+        self.champ_alpha = 0.0
+        self.champ_float = 0.0
+        self.logo_pulse = 0.0
+        self.play_time = 0.0
+        self.unlocked = set(self.data.get("achievements", []))
+
+    def _speed_interval(self):
+        base = {"easy": 0.16, "normal": 0.12, "hard": 0.09}.get(self.difficulty, 0.12)
+        reduction = min(0.07, self.apples * 0.004)
+        mult = 1.6 if self.slow else 1.0
+        return max(0.05, (base - reduction) * mult)
+
+    def _occupied(self):
+        occ = set(self.snake)
+        occ.update(self.obstacles)
+        return occ
+
+    def _spawn_food(self):
+        occ = self._occupied()
+        free = [(c, r) for c in range(COLS) for r in range(ROWS) if (c, r) not in occ]
+        return random.choice(free) if free else (0, 0)
+
+    def _spawn_bonus(self):
+        occ = self._occupied()
+        if self.food:
+            occ.add(self.food)
+        free = [(c, r) for c in range(COLS) for r in range(ROWS) if (c, r) not in occ]
+        if free:
+            self.bonus = random.choice(free)
+            self.bonus_timer = 5.0
+
+    def _spawn_power(self):
+        occ = self._occupied()
+        free = [(c, r) for c in range(COLS) for r in range(ROWS) if (c, r) not in occ]
+        if not free:
+            return
+        kinds = ["slow", "double", "ghost"]
+        pos = random.choice(free)
+        self.power_pickup = (pos, random.choice(kinds))
+
+    def _spawn_obstacles(self):
+        occ = self._occupied()
+        added = 0
+        while added < 3:
+            c, r = random.randint(1, COLS - 2), random.randint(1, ROWS - 2)
+            if (c, r) not in occ and (c, r) != self.food:
+                self.obstacles.append((c, r))
+                occ.add((c, r))
+                added += 1
+
+    def _burst(self, gx, gy, color, n=14, glow=False):
+        px, py = gx * CELL + CELL // 2, gy * CELL + CELL // 2
+        for _ in range(n):
+            self.particles.append(Particle(px, py, color, glow=glow))
+
+    def _unlock(self, aid, title):
+        if aid not in self.unlocked:
+            self.unlocked.add(aid)
+            self.data.setdefault("achievements", []).append(aid)
+            self.achievement_popup = (title, 2.5)
+
+    def _start_play(self, diff):
+        self.difficulty = diff
+        self.reset_match()
+        self.state = State.COUNTDOWN
+        self.fade = 1.0
+        self.fade_target = 0.0
+        self.data["games_played"] = self.data.get("games_played", 0) + 1
+
+    def handle_events(self):
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                self._persist()
+                pygame.quit()
+                raise SystemExit
+            if e.type == pygame.KEYDOWN:
+                self._on_key(e.key)
+            if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                self._on_click(e.pos)
+
+    def _on_key(self, key):
+        if self.state == State.PLAYING:
+            km = {pygame.K_UP: "UP", pygame.K_DOWN: "DOWN",
+                  pygame.K_LEFT: "LEFT", pygame.K_RIGHT: "RIGHT",
+                  pygame.K_w: "UP", pygame.K_s: "DOWN",
+                  pygame.K_a: "LEFT", pygame.K_d: "RIGHT"}
+            if key in km and OPP[km[key]] != self.direction:
+                self.next_dir = km[key]
+            elif key == pygame.K_p:
+                self.state = State.PAUSED
+        elif self.state == State.PAUSED and key == pygame.K_p:
+            self.state = State.PLAYING
+        elif self.state == State.GAME_OVER and key == pygame.K_r:
+            self.state = State.DIFFICULTY
+        elif self.state in (State.HIGH_SCORES, State.CONTROLS, State.STATS,
+                            State.ACHIEVEMENTS, State.DIFFICULTY) and key == pygame.K_ESCAPE:
+            self.state = State.MENU
+        elif self.state == State.MENU and key == pygame.K_ESCAPE:
+            self._persist()
+            pygame.quit()
+            raise SystemExit
+
+    def _on_click(self, pos):
+        if self.state == State.MENU:
+            for b in self.menu_btns:
+                if b.clicked(pos):
+                    self.sounds.play(self.sounds.ui)
+                    {"play": lambda: setattr(self, "state", State.DIFFICULTY),
+                     "scores": lambda: setattr(self, "state", State.HIGH_SCORES),
+                     "controls": lambda: setattr(self, "state", State.CONTROLS),
+                     "stats": lambda: setattr(self, "state", State.STATS),
+                     "achieve": lambda: setattr(self, "state", State.ACHIEVEMENTS),
+                     "quit": self._quit,
+                     }[b.action]()
+        elif self.state == State.DIFFICULTY:
+            for b in self.diff_btns:
+                if b.clicked(pos):
+                    self.sounds.play(self.sounds.ui)
+                    if b.action == "back":
+                        self.state = State.MENU
+                    else:
+                        self._start_play(b.action)
+
+    def _quit(self):
+        self._persist()
+        pygame.quit()
+        raise SystemExit
+
+    def _persist(self):
+        save_data(self.data)
+
+    def _die(self):
+        self.state = State.GAME_OVER
+        self.fade = 0.0
+        self.fade_target = 0.7
+        self.sounds.play(self.sounds.death)
+        if self.score > self.data.get("high_score", 0):
+            self.data["high_score"] = self.score
+        self.data["total_score"] = self.data.get("total_score", 0) + self.score
+        self.data["best_length"] = max(self.data.get("best_length", 0), len(self.snake))
+        self.data["play_time"] = self.data.get("play_time", 0) + int(self.play_time)
+        self._persist()
+
+    def update(self, dt):
+        mouse = pygame.mouse.get_pos()
+        if self.state == State.MENU:
+            for b in self.menu_btns:
+                b.update(dt, mouse)
+        elif self.state == State.DIFFICULTY:
+            for b in self.diff_btns:
+                b.update(dt, mouse)
+
+        self.fade += (self.fade_target - self.fade) * min(1, dt * 5)
+        self.logo_pulse += dt * 2.5
+        self._update_bg(dt)
+        self._update_particles(dt)
+
+        if hasattr(self, "achievement_popup"):
+            self.achievement_popup = (self.achievement_popup[0],
+                                      self.achievement_popup[1] - dt)
+            if self.achievement_popup[1] <= 0:
+                del self.achievement_popup
+
+        if self.state == State.COUNTDOWN:
+            self.countdown -= dt
+            new_int = math.ceil(self.countdown)
+            if new_int != self.count_int and new_int > 0:
+                self.sounds.play(self.sounds.tick)
+            self.count_int = new_int
+            if self.countdown <= 0:
+                self.state = State.PLAYING
+
+        if self.state not in (State.PLAYING, State.PAUSED):
+            return
+
+        if self.state == State.PAUSED:
+            return
+
+        self.play_time += dt
+        self.shake = max(0, self.shake - dt * 4)
+
+        if self.power_timer > 0:
+            self.power_timer -= dt
+            if self.power_timer <= 0:
+                self.ghost = self.slow = self.double = False
+                self.power_type = None
+                self.move_interval = self._speed_interval()
+
+        if self.bonus:
+            self.bonus_timer -= dt
+            if self.bonus_timer <= 0:
+                self.bonus = None
+
+        self.move_timer += dt
+        if self.move_timer >= self.move_interval:
+            self.move_timer -= self.move_interval
+            self._tick_snake()
+
+        if self.apples > 10:
+            self.champ_alpha = min(255, self.champ_alpha + dt * 120)
+            self.champ_float += dt
+
+    def _tick_snake(self):
+        self.direction = self.next_dir
+        self.prev_snake = list(self.snake)
+        hx, hy = self.snake[0]
+        dx, dy = DIRS[self.direction]
+        nx, ny = hx + dx, hy + dy
+
+        if self.ghost:
+            nx %= COLS
+            ny %= ROWS
+        else:
+            if nx < 0 or nx >= COLS or ny < 0 or ny >= ROWS:
+                self._die()
+                return
+
+        new_head = (nx, ny)
+        body = set(self.snake[:-1])
+        if not self.ghost and new_head in body:
+            self._die()
+            return
+        if new_head in self.obstacles:
+            self._die()
+            return
+
+        self.snake.insert(0, new_head)
+        ate = False
+
+        if new_head == self.food:
+            ate = True
+            pts = 10 * (2 if self.double else 1)
+            self.score += pts
+            self.apples += 1
+            self.data["total_apples"] = self.data.get("total_apples", 0) + 1
+            self.food = self._spawn_food()
+            self.shake = 0.35
+            self._burst(nx, ny, C_APPLE)
+            self.sounds.play(self.sounds.eat)
+            self.move_interval = self._speed_interval()
+            if self.apples == 1:
+                self._unlock("first_bite", "First Bite!")
+            if self.apples >= 10:
+                self._unlock("champ", "Champion!")
+            if self.apples >= 25:
+                self._unlock("feast", "Feast Mode!")
+            if random.random() < 0.35:
+                self._spawn_bonus()
+            if self.apples % 7 == 0:
+                self._spawn_power()
+            if self.apples >= 15 and len(self.obstacles) < 12:
+                self._spawn_obstacles()
+
+        elif self.bonus and new_head == self.bonus:
+            ate = True
+            pts = 30 * (2 if self.double else 1)
+            self.score += pts
+            self.apples += 1
+            self.bonus = None
+            self.shake = 0.5
+            self._burst(nx, ny, C_BONUS, 20, glow=True)
+            self.sounds.play(self.sounds.bonus)
+
+        elif hasattr(self, "power_pickup") and new_head == self.power_pickup[0]:
+            ate = True
+            kind = self.power_pickup[1]
+            self.ghost = kind == "ghost"
+            self.slow = kind == "slow"
+            self.double = kind == "double"
+            self.power_type = kind
+            self.power_timer = 8.0
+            self.move_interval = self._speed_interval()
+            del self.power_pickup
+            self._burst(nx, ny, C_ACCENT, 18, glow=True)
+            self.sounds.play(self.sounds.power)
+            self._unlock("power", "Power Player!")
+
+        if not ate:
+            self.snake.pop()
+
+        if self.score >= 100:
+            self._unlock("century", "Century Club!")
+        if len(self.snake) >= 20:
+            self._unlock("long", "Long Boi!")
+
+    def _update_bg(self, dt):
+        for i, (x, y, sp, ph) in enumerate(self.bg_stars):
+            y = (y + sp * 20 * dt) % SCREEN_H
+            self.bg_stars[i] = (x, y, sp, ph + dt)
+
+    def _update_particles(self, dt):
+        self.particles = [p for p in self.particles if p.life > 0]
+        for p in self.particles:
+            p.update(dt)
+
+    def draw(self):
+        self.screen.fill(C_BG_TOP)
+        self._draw_gradient()
+        self._draw_bg_stars()
+        shake_x = random.randint(-4, 4) * self.shake * 8 if self.shake > 0 else 0
+        shake_y = random.randint(-4, 4) * self.shake * 8 if self.shake > 0 else 0
+        game_surf = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+
+        if self.state in (State.PLAYING, State.PAUSED, State.COUNTDOWN, State.GAME_OVER):
+            self._draw_grid(game_surf)
+            self._draw_obstacles(game_surf)
+            t = min(1.0, self.move_timer / self.move_interval) if self.move_interval else 1.0
+            self._draw_snake(game_surf, t)
+            self._draw_food(game_surf)
+            self._draw_bonus(game_surf)
+            if hasattr(self, "power_pickup"):
+                self._draw_power(game_surf)
+            self._draw_particles(game_surf)
+            self._draw_hud(game_surf)
+            if self.state in (State.COUNTDOWN, State.PLAYING):
+                self._draw_logo(game_surf)
+            if self.apples > 10:
+                self._draw_champ(game_surf)
+
+        self.screen.blit(game_surf, (int(shake_x), int(shake_y)))
+
+        if self.state == State.MENU:
+            self._draw_menu()
+        elif self.state == State.DIFFICULTY:
+            self._draw_difficulty()
+        elif self.state == State.HIGH_SCORES:
+            self._draw_panel("High Scores", [f"Best: {self.data.get('high_score', 0)}"])
+        elif self.state == State.CONTROLS:
+            self._draw_panel("Controls", [
+                "Arrow Keys / WASD — Move", "P — Pause", "R — Restart (Game Over)",
+                "ESC — Back to Menu", "Click menu buttons to navigate",
+            ])
+        elif self.state == State.STATS:
+            d = self.data
+            self._draw_panel("Statistics", [
+                f"Games Played: {d.get('games_played', 0)}",
+                f"Total Apples: {d.get('total_apples', 0)}",
+                f"High Score: {d.get('high_score', 0)}",
+                f"Best Length: {d.get('best_length', 0)}",
+                f"Play Time: {d.get('play_time', 0)}s",
+            ])
+        elif self.state == State.ACHIEVEMENTS:
+            titles = {"first_bite": "First Bite — Eat 1 apple",
+                      "champ": "Champion — Eat 10 apples",
+                      "feast": "Feast Mode — Eat 25 apples",
+                      "century": "Century Club — Score 100",
+                      "long": "Long Boi — Length 20",
+                      "power": "Power Player — Use a power-up"}
+            lines = [titles.get(a, a) + ("  ✓" if a in self.unlocked else "  ✗")
+                     for a in titles]
+            self._draw_panel("Achievements", lines)
+        elif self.state == State.COUNTDOWN:
+            self._draw_countdown()
+        elif self.state == State.PAUSED:
+            self._draw_overlay("PAUSED", "Press P to resume")
+        elif self.state == State.GAME_OVER:
+            self._draw_game_over()
+
+        if hasattr(self, "achievement_popup"):
+            self._draw_achievement_popup()
+
+        self._draw_footer(self.screen)
+
+        if self.fade > 0.01:
+            ov = pygame.Surface((SCREEN_W, SCREEN_H))
+            ov.fill((0, 0, 0))
+            ov.set_alpha(int(255 * self.fade))
+            self.screen.blit(ov, (0, 0))
+
+        pygame.display.flip()
+
+    def _draw_gradient(self):
+        for y in range(0, SCREEN_H, 4):
+            t = y / SCREEN_H
+            c = tuple(int(C_BG_TOP[i] + (C_BG_BOT[i] - C_BG_TOP[i]) * t) for i in range(3))
+            pygame.draw.rect(self.screen, c, (0, y, SCREEN_W, 4))
+
+    def _draw_bg_stars(self):
+        for x, y, sp, ph in self.bg_stars:
+            b = int(120 + 80 * math.sin(ph * 2))
+            pygame.draw.circle(self.screen, (b, b, b + 30), (int(x), int(y)), max(1, int(sp)))
+
+    def _draw_grid(self, surf):
+        gs = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        for x in range(0, SCREEN_W, CELL):
+            pygame.draw.line(gs, C_GRID[:3] + (C_GRID[3],), (x, 0), (x, SCREEN_H))
+        for y in range(0, SCREEN_H, CELL):
+            pygame.draw.line(gs, C_GRID[:3] + (C_GRID[3],), (0, y), (SCREEN_W, y))
+        surf.blit(gs, (0, 0))
+
+    def _lerp_pos(self, idx, t):
+        if idx >= len(self.snake):
+            return (0, 0)
+        if idx < len(self.prev_snake) and self.prev_snake[idx] != self.snake[idx]:
+            px, py = self.prev_snake[idx]
+            cx, cy = self.snake[idx]
+            return (px + (cx - px) * t, py + (cy - py) * t)
+        return self.snake[idx]
+
+    def _draw_snake(self, surf, t):
+        n = len(self.snake)
+        for i in range(n - 1, -1, -1):
+            gx, gy = self._lerp_pos(i, t)
+            x, y = gx * CELL, gy * CELL
+            # Tail wiggle
+            wobble = math.sin(pygame.time.get_ticks() * 0.008 + i * 0.5) * (2 if i == n - 1 else 0)
+            rect = pygame.Rect(x + 1, y + 1 + wobble, CELL - 2, CELL - 2)
+            # Shadow
+            sh = rect.copy()
+            sh.y += 3
+            pygame.draw.rect(surf, (0, 0, 0, 60), sh, border_radius=8)
+            col = C_HEAD if i == 0 else (C_SNAKE if i % 2 == 0 else C_SNAKE_DARK)
+            rad = 9 if i == 0 else 7
+            pygame.draw.rect(surf, col, rect, border_radius=rad)
+            if i == 0:
+                self._draw_head_eyes(surf, rect, self.direction)
+
+    def _draw_head_eyes(self, surf, rect, direction):
+        cx, cy = rect.centerx, rect.centery
+        off = {"RIGHT": (4, 0), "LEFT": (-4, 0), "UP": (0, -4), "DOWN": (0, 4)}[direction]
+        for side in (-1, 1):
+            if direction in ("UP", "DOWN"):
+                ex, ey = cx + side * 4 + off[0], cy - 3 + off[1]
+            else:
+                ex, ey = cx - 3 + off[0], cy + side * 4 + off[1]
+            pygame.draw.circle(surf, (20, 30, 25), (ex, ey), 4)
+            blink = 1 if (pygame.time.get_ticks() // 3000) % 2 == 0 else 0.3
+            pygame.draw.circle(surf, (255, 255, 255), (ex, ey), int(3 * blink))
+            pygame.draw.circle(surf, (10, 10, 20), (ex + off[0] // 2, ey + off[1] // 2), 1)
+
+    def _draw_apple(self, surf, gx, gy, pulse_t, base_col, glow_col):
+        t = 0.5 + 0.5 * math.sin(pulse_t)
+        cx, cy = gx * CELL + CELL // 2, gy * CELL + CELL // 2
+        # Glow
+        gr = int(14 + 6 * t)
+        gs = pygame.Surface((gr * 2, gr * 2), pygame.SRCALPHA)
+        pygame.draw.circle(gs, (*glow_col, int(90 + 60 * t)), (gr, gr), gr)
+        surf.blit(gs, (cx - gr, cy - gr))
+        # Shadow
+        pygame.draw.circle(surf, (0, 0, 0, 50), (cx + 2, cy + 3), 7)
+        pygame.draw.circle(surf, base_col, (cx, cy), 7)
+        # Shine
+        pygame.draw.circle(surf, (255, 200, 200), (cx - 2, cy - 3), 2)
+
+    def _draw_food(self, surf):
+        self._draw_apple(surf, self.food[0], self.food[1],
+                         pygame.time.get_ticks() * 0.004, C_APPLE, C_APPLE_GLOW)
+
+    def _draw_bonus(self, surf):
+        if self.bonus:
+            self._draw_apple(surf, self.bonus[0], self.bonus[1],
+                             pygame.time.get_ticks() * 0.008, C_BONUS, (255, 240, 120))
+
+    def _draw_power(self, surf):
+        gx, gy = self.power_pickup[0]
+        kind = self.power_pickup[1]
+        colors = {"slow": (100, 180, 255), "double": (255, 180, 50), "ghost": (180, 130, 255)}
+        cx, cy = gx * CELL + CELL // 2, gy * CELL + CELL // 2
+        col = colors.get(kind, C_ACCENT)
+        t = pygame.time.get_ticks() * 0.005
+        r = 8 + int(2 * math.sin(t))
+        gs = pygame.Surface((r * 3, r * 3), pygame.SRCALPHA)
+        pygame.draw.circle(gs, (*col, 100), (r * 3 // 2, r * 3 // 2), r + 4)
+        surf.blit(gs, (cx - r * 3 // 2, cy - r * 3 // 2))
+        pygame.draw.circle(surf, col, (cx, cy), r)
+        label = {"slow": "S", "double": "x2", "ghost": "G"}[kind]
+        ts = self.font_xs.render(label, True, (255, 255, 255))
+        surf.blit(ts, ts.get_rect(center=(cx, cy)))
+
+    def _draw_obstacles(self, surf):
+        for gx, gy in self.obstacles:
+            r = pygame.Rect(gx * CELL + 2, gy * CELL + 4, CELL - 4, CELL - 4)
+            pygame.draw.rect(surf, (0, 0, 0, 50), r, border_radius=5)
+            r.y -= 2
+            pygame.draw.rect(surf, C_OBSTACLE, r, border_radius=5)
+
+    def _draw_particles(self, surf):
+        for p in self.particles:
+            p.draw(surf)
+        # Champ sparkles
+        if self.apples > 10 and random.random() < 0.15:
+            self.particles.append(Particle(
+                SCREEN_W // 2 + random.randint(-120, 120),
+                SCREEN_H // 2 + 50 + random.randint(-20, 20),
+                C_NEON, speed=1.5, life=0.5, size=3, glow=True))
+
+    def _draw_hud(self, surf):
+        spd = int(1 / self.move_interval) if self.move_interval else 0
+        lines = [
+            f"Score: {self.score}",
+            f"High: {self.data.get('high_score', 0)}",
+            f"Speed: {spd}",
+            f"Apples: {self.apples}",
+        ]
+        if self.power_type:
+            lines.append(f"Power: {self.power_type.upper()} {self.power_timer:.0f}s")
+        for i, txt in enumerate(lines):
+            ts = self.font_sm.render(txt, True, C_TEXT)
+            bg = pygame.Surface((ts.get_width() + 12, ts.get_height() + 4), pygame.SRCALPHA)
+            bg.fill((0, 0, 0, 100))
+            surf.blit(bg, (8, 8 + i * 26))
+            surf.blit(ts, (14, 10 + i * 26))
+
+    def _draw_logo(self, surf):
+        pulse = 0.7 + 0.3 * math.sin(self.logo_pulse)
+        alpha = int(40 + 35 * pulse)
+        ts = self.font_lg.render("AI", True, C_ACCENT)
+        ts.set_alpha(alpha)
+        rect = ts.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2))
+        # Glow behind logo
+        glow = self.font_lg.render("AI", True, (90, 150, 255))
+        glow.set_alpha(int(30 * pulse))
+        surf.blit(glow, glow.get_rect(center=(rect.centerx, rect.centery)))
+        surf.blit(ts, rect)
+
+    def _draw_champ(self, surf):
+        y_off = math.sin(self.champ_float * 3) * 6
+        text = "You are the champ"
+        # Neon layers
+        for dx, dy, a in [(-2, 0, 80), (2, 0, 80), (0, -2, 80), (0, 2, 80), (0, 0, 255)]:
+            layer = self.font_md.render(text, True, C_NEON)
+            layer.set_alpha(min(int(a), self.champ_alpha))
+            surf.blit(layer, layer.get_rect(center=(SCREEN_W // 2 + dx, SCREEN_H // 2 + 50 + y_off + dy)))
+        main = self.font_md.render(text, True, (255, 255, 220))
+        main.set_alpha(int(self.champ_alpha))
+        surf.blit(main, main.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 50 + y_off)))
+
+    def _draw_footer(self, surf):
+        credit = self.font_xs.render(AUTHOR, True, (140, 150, 175))
+        surf.blit(credit, credit.get_rect(center=(SCREEN_W // 2, SCREEN_H - 22)))
+
+    def _draw_menu(self):
+        title = self.font_lg.render("AI SNAKE", True, C_ACCENT)
+        self.screen.blit(title, title.get_rect(center=(SCREEN_W // 2, 100)))
+        sub = self.font_sm.render("Arcade Edition", True, C_TEXT)
+        self.screen.blit(sub, sub.get_rect(center=(SCREEN_W // 2, 155)))
+        for b in self.menu_btns:
+            b.draw(self.screen)
+
+    def _draw_difficulty(self):
+        title = self.font_md.render("Select Difficulty", True, C_TEXT)
+        self.screen.blit(title, title.get_rect(center=(SCREEN_W // 2, 160)))
+        for b in self.diff_btns:
+            b.draw(self.screen)
+
+    def _draw_panel(self, title, lines):
+        ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        ov.fill((0, 0, 0, 160))
+        self.screen.blit(ov, (0, 0))
+        ts = self.font_md.render(title, True, C_ACCENT)
+        self.screen.blit(ts, ts.get_rect(center=(SCREEN_W // 2, 80)))
+        for i, line in enumerate(lines):
+            ls = self.font_sm.render(line, True, C_TEXT)
+            self.screen.blit(ls, ls.get_rect(center=(SCREEN_W // 2, 150 + i * 36)))
+        hint = self.font_xs.render("Press ESC to return", True, (150, 160, 180))
+        self.screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, SCREEN_H - 40)))
+
+    def _draw_countdown(self):
+        num = max(1, self.count_int) if self.countdown > 0 else "GO!"
+        ts = self.font_lg.render(str(num), True, C_ACCENT)
+        self.screen.blit(ts, ts.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 80)))
+
+    def _draw_overlay(self, title, sub):
+        ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        ov.fill((0, 0, 0, 140))
+        self.screen.blit(ov, (0, 0))
+        ts = self.font_lg.render(title, True, C_TEXT)
+        self.screen.blit(ts, ts.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 20)))
+        ss = self.font_sm.render(sub, True, C_ACCENT)
+        self.screen.blit(ss, ss.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 30)))
+
+    def _draw_game_over(self):
+        ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        ov.fill((0, 0, 0, 180))
+        self.screen.blit(ov, (0, 0))
+        ts = self.font_lg.render("GAME OVER", True, (255, 90, 90))
+        self.screen.blit(ts, ts.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 60)))
+        sc = self.font_md.render(f"Score: {self.score}", True, C_TEXT)
+        self.screen.blit(sc, sc.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2)))
+        hi = self.font_sm.render(f"High Score: {self.data.get('high_score', 0)}", True, C_ACCENT)
+        self.screen.blit(hi, hi.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 45)))
+        hint = self.font_sm.render("Press R to Restart  |  ESC for Menu", True, (160, 170, 190))
+        self.screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 110)))
+
+    def _draw_achievement_popup(self):
+        title, _ = self.achievement_popup
+        ts = self.font_md.render(f"Achievement: {title}", True, C_NEON)
+        bg = pygame.Surface((ts.get_width() + 24, ts.get_height() + 12), pygame.SRCALPHA)
+        bg.fill((20, 30, 50, 220))
+        x = SCREEN_W // 2 - bg.get_width() // 2
+        self.screen.blit(bg, (x, SCREEN_H - 70))
+        self.screen.blit(ts, ts.get_rect(center=(SCREEN_W // 2, SCREEN_H - 64)))
+
+    def run(self):
+        while True:
+            dt = self.clock.tick(FPS) / 1000.0
+            self.handle_events()
+            self.update(dt)
+            self.draw()
+
+
+def main():
+    Game().run()
+
+
+if __name__ == "__main__":
+    main()
